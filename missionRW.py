@@ -385,6 +385,15 @@ def tuple_entry(*parts: Value) -> TupleEntry:
     return TupleEntry(parts=list(parts))
 
 
+
+def main():
+    doc = read_mission_file("some.mission")
+    write_mission_file(doc, "roundtrip.mission")
+    
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
 # Example usage (optional):
 # doc = read_mission_file("some.mission")
 # write_mission_file(doc, "roundtrip.mission")
