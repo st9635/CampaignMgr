@@ -1,20 +1,21 @@
 """
-PWCG / IL-2 style .mission file reader + writer (text format).
+PWCG / IL-2 style .mission file reader + writer (text format) — UPDATED
+
+Adds support for assignment values with colon-chains, e.g.:
+  Time = 12:0:0;
 
 Supports:
-- Top-level and nested blocks:   BlockName { ... }
-- Assignments:                  Key = Value;
-- Lists:                        Key = [1,2,3];
-- Colon-separated entries:      0 : 0;    or   500 : 90 : 5;
-- Comments that start with '#': # comment (preserved)
-
-This is a generic parser/writer that round-trips the mission text structure.
+- Blocks:        Name { ... }
+- Assignments:   Key = Value;
+- Lists:         Key = [1,2,3];
+- Tuple entries: 0 : 0;   or 500 : 90 : 5;
+- Comments:      # ...
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Union
+from typing import List, Optional, Sequence, Union
 import re
 
 
@@ -24,37 +25,48 @@ import re
 
 @dataclass(frozen=True)
 class Atom:
-    """Unquoted token value as it appeared in the file (identifier or number)."""
+    """Unquoted token value as it appeared in the file (identifier or number-like)."""
     text: str
 
     def __str__(self) -> str:
         return self.text
 
 
-Value = Union[str, Atom, List["Value"]]  # quoted string, unquoted atom, or list of values
+@dataclass
+class ColonSeq:
+    """Colon-separated value chain used as a single assignment value, e.g. 12:0:0"""
+    parts: List["Value"]
+
+
+Value = Union[str, Atom, List["Value"], ColonSeq]  # quoted string, unquoted atom, list, or colon-seq
 
 
 @dataclass
 class Comment:
     text: str  # includes leading '#'
 
+
 @dataclass
 class Assignment:
     key: Atom
     value: Value
 
+
 @dataclass
 class TupleEntry:
     parts: List[Value]  # values separated by ':' and ending with ';'
 
+
 @dataclass
 class Bare:
-    value: Value  # a single value followed by ';' (rare, but supported)
+    value: Value  # a single value followed by ';'
+
 
 @dataclass
 class Block:
     name: Atom
     statements: List["Statement"]
+
 
 Statement = Union[Comment, Assignment, TupleEntry, Bare, Block]
 
@@ -76,9 +88,7 @@ class Token:
 
 
 _SYMBOLS = {"{", "}", "[", "]", "=", ";", ":", ","}
-
 _WORD_RE = re.compile(r"[^\s\{\}\[\]=;:,#\"']+")
-_NUMBER_LIKE_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
 
 
 def _tokenize(text: str) -> List[Token]:
@@ -89,12 +99,11 @@ def _tokenize(text: str) -> List[Token]:
     while i < n:
         ch = text[i]
 
-        # whitespace
         if ch.isspace():
             i += 1
             continue
 
-        # comment (consume to end of line)
+        # comment to end-of-line
         if ch == "#":
             start = i
             while i < n and text[i] != "\n":
@@ -112,14 +121,7 @@ def _tokenize(text: str) -> List[Token]:
                 if c == "\\" and i + 1 < n:
                     nxt = text[i + 1]
                     if nxt in {'"', "\\", "n", "t", "r"}:
-                        if nxt == "n":
-                            buf.append("\n")
-                        elif nxt == "t":
-                            buf.append("\t")
-                        elif nxt == "r":
-                            buf.append("\r")
-                        else:
-                            buf.append(nxt)
+                        buf.append({"n": "\n", "t": "\t", "r": "\r"}.get(nxt, nxt))
                         i += 2
                         continue
                 if c == '"':
@@ -132,7 +134,7 @@ def _tokenize(text: str) -> List[Token]:
             tokens.append(Token("STRING", "".join(buf), start))
             continue
 
-        # symbol
+        # symbols
         if ch in _SYMBOLS:
             tokens.append(Token("SYMBOL", ch, i))
             i += 1
@@ -160,10 +162,6 @@ class _Parser:
 
     def _peek(self) -> Token:
         return self.tokens[self.idx]
-
-    def _peek2(self) -> Token:
-        j = min(self.idx + 1, len(self.tokens) - 1)
-        return self.tokens[j]
 
     def _next(self) -> Token:
         tok = self.tokens[self.idx]
@@ -209,9 +207,7 @@ class _Parser:
             self._next()
             return Comment(tok.value)
 
-        # block / assignment / tuple-entry / bare
         first = self._parse_value_token_only()
-
         nxt = self._peek()
 
         # Block: Name { ... }
@@ -223,12 +219,22 @@ class _Parser:
             self._expect("SYMBOL", "}")
             return Block(name=first, statements=body)
 
-        # Assignment: key = value ;
+        # Assignment: key = value(:value...)? ;
         if nxt.kind == "SYMBOL" and nxt.value == "=":
             if not isinstance(first, Atom):
                 raise ValueError(f"Assignment key must be an unquoted token at {tok.pos}")
             self._expect("SYMBOL", "=")
-            value = self._parse_value()
+
+            value: Value = self._parse_value()
+
+            # NEW: allow colon-chained values in assignment (e.g. Time = 12:0:0;)
+            if self._peek().kind == "SYMBOL" and self._peek().value == ":":
+                parts: List[Value] = [value]
+                while self._peek().kind == "SYMBOL" and self._peek().value == ":":
+                    self._expect("SYMBOL", ":")
+                    parts.append(self._parse_value())
+                value = ColonSeq(parts=parts)
+
             self._expect("SYMBOL", ";")
             return Assignment(key=first, value=value)
 
@@ -255,7 +261,6 @@ class _Parser:
         if tok.kind == "WORD":
             return Atom(tok.value)
         if tok.kind == "SYMBOL" and tok.value == "[":
-            # list
             items: List[Value] = []
             if self._peek().kind == "SYMBOL" and self._peek().value == "]":
                 self._expect("SYMBOL", "]")
@@ -298,9 +303,10 @@ def _value_to_text(v: Value) -> str:
         return v.text
     if isinstance(v, str):
         return f"\"{_escape_string(v)}\""
+    if isinstance(v, ColonSeq):
+        return ":".join(_value_to_text(p) for p in v.parts)
     if isinstance(v, list):
         return "[" + ",".join(_value_to_text(x) for x in v) + "]"
-    # fallback (shouldn't usually happen)
     return str(v)
 
 
@@ -340,7 +346,6 @@ def dumps(doc: MissionDoc, indent: str = "  ") -> str:
     for s in doc.statements:
         emit_statement(s, 0)
 
-    # trim trailing blank lines
     while lines and lines[-1] == "":
         lines.pop()
 
@@ -348,9 +353,7 @@ def dumps(doc: MissionDoc, indent: str = "  ") -> str:
 
 
 def loads(text: str) -> MissionDoc:
-    tokens = _tokenize(text)
-    parser = _Parser(tokens)
-    return parser.parse_doc()
+    return _Parser(_tokenize(text)).parse_doc()
 
 
 def read_mission_file(path: str, encoding: str = "utf-8") -> MissionDoc:
@@ -359,32 +362,24 @@ def read_mission_file(path: str, encoding: str = "utf-8") -> MissionDoc:
 
 
 def write_mission_file(doc: MissionDoc, path: str, encoding: str = "utf-8") -> None:
-    text = dumps(doc)
     with open(path, "w", encoding=encoding, newline="\n") as f:
-        f.write(text)
+        f.write(dumps(doc))
 
 
 # ---------------------------
-# Minimal helper builders
+# Convenience builders
 # ---------------------------
 
 def A(text: str) -> Atom:
-    """Convenience: create an unquoted Atom."""
     return Atom(text)
-
-
-def block(name: str, *statements: Statement) -> Block:
-    return Block(name=A(name), statements=list(statements))
 
 
 def assign(key: str, value: Value) -> Assignment:
     return Assignment(key=A(key), value=value)
 
 
-def tuple_entry(*parts: Value) -> TupleEntry:
-    return TupleEntry(parts=list(parts))
-
-
+def block(name: str, *statements: Statement) -> Block:
+    return Block(name=A(name), statements=list(statements))
 
 def main():
     doc = read_mission_file("some.mission")
@@ -394,19 +389,3 @@ def main():
 if __name__ == "__main__":
     raise SystemExit(main())
 
-# Example usage (optional):
-# doc = read_mission_file("some.mission")
-# write_mission_file(doc, "roundtrip.mission")
-#
-# Or creating a very small mission-like file:
-# doc2 = MissionDoc(statements=[
-#     Comment("# Mission File Version = 1.0;"),
-#     block("Options",
-#           assign("LCName", A("0")),
-#           assign("PlayerConfig", "some.cfg"),
-#           block("Countries",
-#                 tuple_entry(A("0"), A("0")),
-#                 tuple_entry(A("101"), A("1")),
-#           )),
-# ])
-# write_mission_file(doc2, "new.mission")
